@@ -1,0 +1,13 @@
+{
+  "name": "radiobridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node tools/serve.mjs",
+    "test": "node --test test/*.test.js",
+    "measure": "node tools/measure.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "RadioBridge — Текст по звуку",
+  "short_name": "RadioBridge",
+  "lang": "ru",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b101c",
+  "theme_color": "#111827",
+  "icons": [{ "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

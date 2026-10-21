@@ -1,0 +1,7 @@
+{
+  "profile": "RB-1/4FSK-25 experimental v1",
+  "crc_check": { "ascii": "123456789", "crc16_hex": "29b1" },
+  "packet": { "text": "RB", "from": "BASE", "to": "FIELD", "id": 1, "hex": "52420101020000010002524243cf" },
+  "mapping": { "00": 1200, "01": 1250, "10": 1300, "11": 1350 },
+  "audio": { "rate": 8000, "baud": 25, "samples_per_symbol": 320, "phase_start_radians": 0, "amplitude": 0.65, "lead_seconds": 0.15, "tail_seconds": 0.12, "edge_ramp_seconds": 0.005 }
+}
