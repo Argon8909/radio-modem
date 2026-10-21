@@ -1,10 +1,12 @@
 import { Receiver, modulate } from './modem.js';
 import { encodePacket } from './packet.js';
 import { noiseChannel } from './channel.js';
-let receiver = new Receiver(event => postMessage(event));
+let epoch = 0;
+const makeReceiver = () => { const current = epoch; return new Receiver(event => postMessage({ ...event, epoch: current })); };
+let receiver = makeReceiver();
 onmessage = ({ data }) => {
-  if (data.type === 'reset') receiver = new Receiver(event => postMessage(event));
-  if (data.type === 'samples') receiver.push(data.samples);
+  if (data.type === 'reset') { epoch = data.epoch ?? epoch + 1; receiver = makeReceiver(); }
+  if (data.type === 'samples' && data.epoch === epoch) receiver.push(data.samples);
   if (data.type === 'selftest') {
     const events = [];
     const rx = new Receiver(e => events.push(e));

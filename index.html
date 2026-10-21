@@ -14,7 +14,7 @@
   <main>
     <header>
       <div class="brand"><span class="brand-icon" aria-hidden="true">≋</span><div><h1>RadioBridge</h1><p>Текст по звуку</p></div></div>
-      <span class="badge">ПРОТОТИП 0.1</span>
+      <span class="badge">ПРОТОТИП 0.2</span>
     </header>
     <div id="context-warning" class="notice" hidden></div>
     <section class="status-bar" aria-label="Состояние модема">
@@ -26,37 +26,62 @@
         <div class="addresses">
           <label>Это устройство<select id="from"><option>BASE</option><option>FIELD</option></select></label>
           <span class="arrow" aria-hidden="true">→</span>
-          <label>Получатель<select id="to"><option>FIELD</option><option>BASE</option><option value="ALL">Всем</option></select></label>
+          <label>Получатель<select id="to"><option>FIELD</option><option>BASE</option></select></label>
         </div>
         <label for="text" class="text-label">Текст сообщения</label>
         <textarea id="text" rows="5" placeholder="Например: Привет, как слышно?" spellcheck="false"></textarea>
-        <div class="text-meta"><span id="byte-count">0 / 96 байт</span><span id="duration">—</span></div>
-        <div class="buttons"><button id="send" class="primary" disabled>Передать звуком <span aria-hidden="true">↗</span></button><button id="stop-tx" class="danger" hidden>Прервать</button></div>
-        <p class="hint">Перед передачей включите приём на другом устройстве. Держите страницу открытой и начните со средней громкости.</p>
+        <div class="text-meta"><span id="byte-count">0 / 640 байт</span><span id="duration">—</span></div>
+        <div class="buttons"><button id="send" class="primary" disabled>Отправить</button><button id="stop-tx" class="danger" hidden>Приостановить сообщение</button></div>
+        <p class="hint">На втором устройстве включите связь. Приём и передача переключаются автоматически. Доставка отмечается после подтверждения получателя.</p>
       </section>
       <section class="card receive" aria-labelledby="receive-title">
         <div class="card-title"><h2 id="receive-title">Приём</h2><span class="subtle">02 / МИКРОФОН</span></div>
         <div class="visualizer" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         <label for="level" class="level-label">Уровень микрофона <span id="level-value">—</span></label>
         <meter id="level" min="0" max="1" low="0.01" high="0.8" optimum="0.2" value="0">Уровень микрофона</meter>
-        <button id="listen" class="secondary">Слушать</button>
-        <p class="hint">Разрешите доступ к микрофону. Приём работает, пока страница активна и экран устройства включён.</p>
+        <button id="listen" class="secondary" disabled>Включить связь</button>
+        <p class="hint">Связь работает при открытой странице. При сворачивании она приостанавливается; сообщения и принятые блоки сохраняются.</p>
       </section>
     </div>
+    <details class="card diagnostics" id="transfer-settings">
+      <summary>Параметры передачи и повторов</summary>
+      <div class="settings-grid">
+        <label>Текст в блоке, байт<select id="block-size"><option>12</option><option>16</option><option selected>20</option><option>24</option><option>32</option></select></label>
+        <label>Максимум блоков: <output id="max-blocks-value">32 · лимит 640 байт</output><input id="max-blocks" type="range" min="1" max="64" value="32"></label>
+        <label>Блоков до подтверждения<select id="window-size"><option>1</option><option>2</option><option selected>4</option><option>8</option></select></label>
+        <label>Повторов после паузы<input id="retry-count" type="number" min="0" max="10" value="3"></label>
+        <label>Интервал повторов, секунд<input id="retry-interval" type="number" min="5" max="3600" value="30"></label>
+        <label>Коротких повторов запроса / блока<input id="request-retries" type="number" min="0" max="5" value="3"></label>
+      </div>
+      <p class="hint">Настройки применяются к новым сообщениям. 0 повторов — только первая попытка. Пауза может быть до 10% длиннее для уменьшения одновременных передач. Повторы сохранённого сообщения можно изменить в очереди.</p>
+    </details>
+    <section class="card messages-card" aria-labelledby="queue-title">
+      <div class="card-title"><h2 id="queue-title">Исходящие · очередь доставки</h2></div>
+      <p id="queue-empty" class="empty">Сообщения сохраняются здесь до и после отправки.</p>
+      <ol id="outbox" aria-live="polite" aria-relevant="additions"></ol>
+    </section>
     <section class="card messages-card" aria-labelledby="messages-title">
       <div class="card-title"><h2 id="messages-title">Журнал сообщений</h2><button id="clear" class="quiet">Очистить</button></div>
       <p id="empty" class="empty">Здесь появятся переданные и принятые сообщения.</p>
       <ol id="messages" aria-live="polite" aria-relevant="additions"></ol>
+      <p id="partial" class="hint" role="status"></p>
     </section>
-    <details class="card diagnostics">
+    <details class="card diagnostics" id="diagnostics">
       <summary>Диагностика и проверка</summary>
       <dl><div><dt>Профиль</dt><dd>RB-1 / 4FSK-25</dd></div><div><dt>Тоны</dt><dd>1200 · 1250 · 1300 · 1350 Гц</dd></div><div><dt>Смещение AFC</dt><dd id="afc">—</dd></div><div><dt>Синхронизация</dt><dd id="sync">Ожидание</dd></div><div><dt>Принято / ошибки</dt><dd id="counts">0 / 0</dd></div><div><dt>Аудиоустройство</dt><dd id="audio-rate">—</dd></div></dl>
+      <p class="hint">Протокол: <span id="protocol-event">ожидание</span></p>
       <button id="selftest" class="secondary small">Проверить модем без микрофона</button>
       <p id="test-result" role="status" class="hint">Самопроверка: текст → звук → шум и сдвиг +80 Гц → текст и CRC.</p>
       <p id="offline-status" class="hint"></p>
     </details>
     <footer>Открытый экспериментальный модем · Arkadiy Goncharov · MIT</footer>
   </main>
+  <script>
+    if (location.protocol === 'file:') {
+      const warning = document.getElementById('context-warning'); warning.hidden = false;
+      warning.textContent = 'Откройте приложение через localhost или HTTPS. При открытии HTML-файла напрямую браузер блокирует JavaScript-модули.';
+    }
+  </script>
   <script type="module" src="./src/app.js"></script>
 </body>
 </html>

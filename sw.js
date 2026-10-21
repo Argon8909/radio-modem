@@ -1,7 +1,8 @@
-const CACHE = 'radiobridge-v1';
+const CACHE = 'radiobridge-v2-reliable-1';
 const FILES = ['./', './index.html', './style.css', './manifest.webmanifest', './icon.svg',
   './src/app.js', './src/packet.js', './src/modem.js', './src/storage.js', './src/channel.js',
-  './src/resampler.js', './src/rx-worker.js', './src/capture-worklet.js'];
+  './src/resampler.js', './src/rx-worker.js', './src/capture-worklet.js',
+  './src/reliable-protocol.js', './src/transport.js', './src/audio-link.js'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(FILES)).then(() => self.skipWaiting()));
 });

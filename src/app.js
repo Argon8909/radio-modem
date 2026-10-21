@@ -1,184 +1,225 @@
-import { MAX_BYTES, encodePacket } from './packet.js';
-import { PROFILE, duration, modulate } from './modem.js';
-import { readMessages, saveMessage, clearMessages } from './storage.js';
+import { readMessages, saveMessage, clearMessages, reliableStore } from './storage.js';
+import { Transport } from './transport.js';
+import { AudioLink } from './audio-link.js';
+import { DEFAULTS, settings, decodeReliable, estimateSeconds } from './reliable-protocol.js';
 
 const $ = id => document.getElementById(id);
-let context, capture, stream, microphone, silent, source, wakeLock;
-let receiving = false, sending = false, testing = false, requesting = false;
-let passed = 0, failed = 0;
-let messageId = Math.floor(Math.random() * 65536);
-let worker = makeWorker();
-
+const fields = { blockSize: 'block-size', maxBlocks: 'max-blocks', window: 'window-size', retries: 'retry-count', interval: 'retry-interval', requestRetries: 'request-retries' };
+const labels = { OFFER: 'Рукопожатие', READY: 'Готовность к приёму', DATA: 'Блок данных', CHECK: 'Запрос подтверждения', REPORT: 'Подтверждение блоков' };
+let engine, legacy = [], requesting = false, queueing = false, testing = false, passed = 0, failed = 0, txLabel = '', deviceRevision = 0;
+const link = new AudioLink(onAudio);
 function status(text, mode = '') { $('status').textContent = text; $('status-dot').className = `dot ${mode}`; }
 function warning(text) { $('context-warning').hidden = false; $('context-warning').textContent = text; }
-function makeWorker() {
-  const instance = new Worker(new URL('./rx-worker.js', import.meta.url), { type: 'module' });
-  instance.onmessage = ({ data }) => {
-    if (data.type === 'test-result') {
-      testing = false;
-      $('test-result').textContent = data.ok ? `Самопроверка пройдена: текст восстановлен, CRC верна. AFC: ${data.offset.toFixed(1)} Гц. Это программный тест; микрофон не использовался.` : 'Самопроверка не пройдена.';
-      controls(); return;
-    }
-    if (!receiving) return;
-    if (data.type === 'level') {
-      $('level').value = data.rms;
-      $('level-value').textContent = `${(20 * Math.log10(Math.max(data.rms, 1e-6))).toFixed(0)} dBFS`;
-      if (data.offset !== null) $('afc').textContent = `${data.offset.toFixed(1)} Гц`;
-    }
-    if (data.type === 'sync') {
-      $('afc').textContent = `${data.offset.toFixed(1)} Гц`;
-      $('sync').textContent = 'Преамбула найдена · принимаю пакет';
-      status('Принимаю сообщение…', 'active');
-    }
-    if (data.type === 'error') { failed++; $('sync').textContent = data.message; updateCounts(); }
-    if (data.type === 'search') status('Слушаю эфир', 'active');
-    if (data.type === 'packet') {
-      passed++; updateCounts();
-      $('sync').textContent = 'Пакет принят · CRC верна';
-      if (data.packet.to === $('from').value || data.packet.to === 'ALL') addMessage({ ...data.packet, direction: 'rx', at: Date.now(), offset: data.offset });
-      else $('sync').textContent = `Пакет для ${data.packet.to} · пропущен`;
-    }
-  };
-  instance.onerror = () => {
-    if (receiving) stopListening();
-    testing = false; controls();
-    status('Ошибка приёмника. Перезагрузите страницу.');
-  };
-  return instance;
-}
-function updateCounts() { $('counts').textContent = `${passed} / ${failed}`; }
+function currentSettings() { return settings(Object.fromEntries(Object.entries(fields).map(([key, id]) => [key, Number($(id).value)]))); }
 function controls() {
-  const n = new TextEncoder().encode($('text').value).length;
-  $('byte-count').textContent = `${n} / ${MAX_BYTES} байт`;
-  $('byte-count').className = n > MAX_BYTES ? 'over' : '';
-  $('duration').textContent = n && n <= MAX_BYTES ? `≈ ${duration(new Uint8Array(n + 12)).toFixed(1)} с` : '—';
-  $('send').disabled = sending || requesting || testing || n === 0 || n > MAX_BYTES || !window.AudioContext;
-  $('listen').disabled = sending || requesting || testing || !navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode;
-  $('listen').textContent = requesting ? 'Доступ к микрофону…' : receiving ? 'Остановить приём' : 'Слушать';
-  $('selftest').disabled = sending || receiving || requesting || testing;
-  $('from').disabled = $('to').disabled = sending || receiving || requesting;
-  $('text').disabled = sending;
-  $('stop-tx').hidden = !sending;
-  document.querySelector('.receive').classList.toggle('listening', receiving);
+  let s;
+  try { s = currentSettings(); } catch (error) { $('send').disabled = true; $('duration').textContent = error.message; return; }
+  const n = new TextEncoder().encode($('text').value).length, max = s.blockSize * s.maxBlocks;
+  $('byte-count').textContent = `${n} / ${max} байт`; $('byte-count').className = n > max ? 'over' : '';
+  $('max-blocks-value').textContent = `${s.maxBlocks} · лимит ${max} байт`;
+  const seconds = Math.ceil(estimateSeconds(n, s));
+  $('duration').textContent = n && n <= max ? `${Math.ceil(n / s.blockSize)} блоков · ≈ ${seconds < 60 ? `${seconds} с` : `${Math.ceil(seconds / 60)} мин`} без повторов` : '—';
+  $('send').disabled = !engine || queueing || requesting || testing || n === 0 || n > max || $('to').value === $('from').value;
+  $('listen').disabled = !engine || requesting || testing || !navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode;
+  $('listen').textContent = requesting ? 'Доступ к микрофону…' : link.opened ? 'Выключить связь' : 'Включить связь';
+  $('selftest').disabled = link.opened || requesting || testing;
+  $('from').disabled = link.opened || requesting || queueing;
+  $('stop-tx').hidden = !engine?.active;
+  document.querySelector('.receive').classList.toggle('listening', link.opened && !link.transmitting);
 }
-async function audio() {
-  context ??= new AudioContext({ latencyHint: 'interactive' });
-  await context.resume();
-  if (context.state !== 'running') throw new Error('Браузер приостановил звук. Нажмите кнопку ещё раз.');
-  $('audio-rate').textContent = `${context.sampleRate} → ${PROFILE.rate} Гц`;
-  return context;
+function overallStatus() {
+  if (link.transmitting) { status(`Передаю: ${txLabel}`, 'tx'); return; }
+  if (!link.opened) { status('Связь выключена · очередь сохранена'); return; }
+  if (engine?.active) {
+    status(engine.active.job.status === 'waiting' ? 'Жду подтверждение второго устройства…' : 'Передача сообщения…', 'active');
+  } else status('Связь включена · слушаю', 'active');
 }
-async function keepAwake() {
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* Foreground use is still possible. */ }
-}
-function stopListening() {
-  receiving = false;
-  capture?.disconnect(); microphone?.disconnect(); silent?.disconnect();
-  stream?.getTracks().forEach(track => track.stop());
-  capture = microphone = silent = stream = undefined;
-  worker.postMessage({ type: 'reset' });
-  wakeLock?.release().catch(() => {}); wakeLock = undefined;
+async function stopConnection(message) {
+  const stopping = engine?.stop(); link.close();
+  try { await stopping; } catch (error) { warning(`Не удалось сохранить состояние: ${error.message}`); }
   $('level').value = 0; $('level-value').textContent = '—';
-  $('sync').textContent = 'Ожидание';
-  status('Приём остановлен'); controls();
+  controls(); overallStatus(); if (message) status(message);
 }
-async function startListening() {
-  if (receiving || requesting) return;
+async function startConnection() {
+  if (link.opened || requesting) return;
   requesting = true; controls();
-  try {
-    const ctx = await audio();
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false });
-    await ctx.audioWorklet.addModule(new URL('./capture-worklet.js', import.meta.url));
-    worker.postMessage({ type: 'reset' });
-    microphone = ctx.createMediaStreamSource(stream);
-    capture = new AudioWorkletNode(ctx, 'rb-capture');
-    capture.port.onmessage = ({ data }) => { if (receiving) worker.postMessage({ type: 'samples', samples: data }, [data.buffer]); };
-    silent = ctx.createGain(); silent.gain.value = 0;
-    microphone.connect(capture); capture.connect(silent); silent.connect(ctx.destination);
-    receiving = true;
-    await keepAwake();
-    $('sync').textContent = 'Поиск преамбулы'; status('Слушаю эфир', 'active');
-  } catch (error) {
-    stopListening();
-    status(error.name === 'NotAllowedError' ? 'Нет доступа к микрофону. Разрешите его в настройках сайта.' : `Не удалось включить приём: ${error.message}`);
-  } finally { requesting = false; controls(); }
+  try { await link.open(); await engine.start(); }
+  catch (error) { link.close(); warning(error.name === 'NotAllowedError' ? 'Разрешите микрофон в настройках сайта. Сообщение остаётся в очереди.' : error.message); }
+  finally { requesting = false; controls(); overallStatus(); }
+  engine.tick();
 }
-async function send() {
-  if (sending || requesting || testing) return;
-  const packet = { text: $('text').value, from: $('from').value, to: $('to').value, id: messageId++ & 65535 };
-  let bytes;
-  try { bytes = encodePacket(packet.text, packet); } catch (error) { status(error.message); return; }
-  if (receiving) stopListening();
-  sending = true; controls(); status('Подготавливаю передачу…', 'tx');
-  try {
-    const ctx = await audio();
-    const samples = modulate(bytes);
-    const buffer = ctx.createBuffer(1, samples.length, PROFILE.rate);
-    buffer.copyToChannel(samples, 0);
-    source = ctx.createBufferSource(); source.buffer = buffer; source.connect(ctx.destination);
-    let interrupted = false;
-    $('stop-tx').onclick = () => { interrupted = true; source?.stop(); };
-    const done = new Promise(resolve => { source.onended = resolve; });
-    source.start(); status(`Передаю… ≈ ${duration(bytes).toFixed(1)} с`, 'tx');
-    await done;
-    source.disconnect(); source = undefined;
-    if (!interrupted) await addMessage({ ...packet, direction: 'tx', at: Date.now() });
-    status(interrupted ? 'Передача прервана' : 'Звук передан. Приём на другом устройстве не подтверждён.');
-  } catch (error) { status(`Ошибка передачи: ${error.message}`); }
-  finally { sending = false; controls(); }
+async function onAudio(event) {
+  if (event.type === 'opened') $('audio-rate').textContent = `${event.rate} → 8000 Гц`;
+  if (event.type === 'level') {
+    $('level').value = event.rms;
+    $('level-value').textContent = `${(20 * Math.log10(Math.max(event.rms, 1e-6))).toFixed(0)} dBFS`;
+    if (event.offset !== null) $('afc').textContent = `${event.offset.toFixed(1)} Гц`;
+  }
+  if (event.type === 'sync') { $('afc').textContent = `${event.offset.toFixed(1)} Гц`; $('sync').textContent = 'Преамбула найдена · принимаю пакет'; }
+  if (event.type === 'error') { failed++; $('sync').textContent = event.message; }
+  if (event.type === 'fatal') { warning(event.message); await stopConnection(event.message); }
+  if (event.type === 'packet') {
+    passed++; $('sync').textContent = 'CRC пакета верна';
+    if (event.packet.version === 2) {
+      try {
+        const frame = decodeReliable(event.packet);
+        $('protocol-event').textContent = `RX ${frame.kind} · #${frame.id.slice(-6)}`;
+        await engine.receive(frame); engine.tick();
+      } catch (error) { failed++; $('sync').textContent = error.message; }
+    } else if (event.packet.to === $('from').value || event.packet.to === 'ALL') {
+      const message = { ...event.packet, direction: 'rx', at: Date.now() };
+      legacy.push(message); renderMessages();
+      try { await saveMessage(message); } catch (error) { warning(error.message); }
+      warning('Принят пакет старого прототипа 0.1 без подтверждения. Для нового обмена обновите обе станции до 0.2.');
+    }
+  }
+  if (event.type === 'transmitting') txLabel = event.frame.kind === 'DATA' ? `блок ${event.frame.index + 1}` : labels[event.frame.kind];
+  $('counts').textContent = `${passed} / ${failed}`;
+  controls(); if (event.type !== 'fatal') overallStatus();
 }
-function renderMessage(message, prepend = true) {
-  const item = document.createElement('li'); item.className = `message ${message.direction}`;
-  const meta = document.createElement('div'); meta.className = 'message-meta';
-  const type = document.createElement('strong'); type.textContent = message.direction === 'rx' ? 'ПРИНЯТО · CRC ✓' : 'ЗВУК ПЕРЕДАН';
-  const route = document.createElement('span'); route.textContent = `${message.from} → ${message.to} · #${message.id}`;
-  const time = document.createElement('time'); time.dateTime = new Date(message.at).toISOString(); time.textContent = new Date(message.at).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
-  meta.append(type, route, time);
-  const body = document.createElement('p'); body.textContent = message.text;
-  item.append(meta, body);
-  $('messages')[prepend ? 'prepend' : 'append'](item);
-  while ($('messages').children.length > 100) $('messages').lastChild.remove();
-  $('empty').hidden = true;
+async function useDevice() {
+  const revision = ++deviceRevision;
+  engine = null; controls();
+  const device = $('from').value;
+  const candidate = new Transport({ device, store: reliableStore, transmit: (frame, valid) => link.send(frame, valid),
+    onChange: () => { if (engine === candidate) { renderQueue(); renderMessages(); controls(); overallStatus(); } },
+    onEvent: event => {
+      if (event.frame) $('protocol-event').textContent = `${event.type.toUpperCase()} ${event.frame.kind} · #${event.frame.id.slice(-6)}`;
+      if (event.type === 'warning') warning(event.message);
+      if (event.type === 'error') { warning(event.message); stopConnection(event.message); }
+    }
+  });
+  await candidate.init(); if (revision !== deviceRevision) return; engine = candidate;
+  renderQueue(); renderMessages(); controls(); overallStatus();
 }
-async function addMessage(message) {
-  renderMessage(message);
-  try { await saveMessage(message); } catch { warning('Сообщения отображаются, но браузер не разрешил сохранить журнал локально.'); }
+function element(tag, text, className) {
+  const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el;
+}
+const stateNames = { queued: 'В очереди', sending: 'Передача', waiting: 'Ожидание подтверждения', deferred: 'Ожидание следующей попытки',
+  paused: 'Приостановлено', stopped: 'Доставка не подтверждена · повторы закончились', delivered: 'Доставлено · подтверждено получателем' };
+function renderQueue() {
+  if (!engine) return;
+  $('outbox').replaceChildren();
+  const jobs = engine.state.outbox;
+  $('queue-empty').hidden = jobs.length > 0;
+  for (const job of [...jobs].reverse()) {
+    const item = element('li', undefined, 'queue-item'); item.dataset.id = job.id; item.dataset.state = job.status;
+    const head = element('div', undefined, 'message-meta');
+    head.append(element('strong', stateNames[job.status]), element('span', `${job.from} → ${job.to} · #${job.id.slice(-6)}`));
+    item.append(head, element('p', job.text, 'queue-text'));
+    const count = job.received.filter(Boolean).length;
+    item.append(element('p', `Подтверждено ${count}/${job.meta.count} блоков · повторные сеансы ${job.retriesUsed}/${job.settings.retries}`, 'hint'));
+    if (job.reason) item.append(element('p', job.reason, 'hint'));
+    if (job.status === 'deferred') {
+      const countdown = element('p', '', 'hint countdown'); countdown.dataset.next = job.nextAttemptAt; item.append(countdown);
+    }
+    if (job.status !== 'delivered') {
+      const actions = element('div', undefined, 'queue-actions');
+      const paused = ['paused', 'stopped'].includes(job.status);
+      const action = element('button', paused ? 'Продолжить' : 'Пауза', 'secondary small');
+      action.onclick = async () => {
+        try {
+          if (paused) { await engine.resume(job.id); if (!link.opened) await startConnection(); }
+          else { const active = engine.active?.job.id === job.id; await engine.pause(job.id); if (active) link.cancelTransmit?.(); }
+        } catch (error) { warning(error.message); }
+      };
+      actions.append(action);
+      const details = element('details', undefined, 'retry-editor'); details.append(element('summary', 'Изменить повторы'));
+      const retries = element('input'); retries.type = 'number'; retries.min = '0'; retries.max = '10'; retries.value = job.settings.retries;
+      const interval = element('input'); interval.type = 'number'; interval.min = '5'; interval.max = '3600'; interval.value = job.settings.interval;
+      const a = element('label', 'Повторов после паузы'); a.append(retries);
+      const b = element('label', 'Интервал, секунд'); b.append(interval);
+      const save = element('button', 'Сохранить', 'quiet');
+      save.onclick = () => engine.updateRetryPolicy(job.id, Number(retries.value), Number(interval.value)).catch(e => warning(e.message));
+      details.append(a, b, save); actions.append(details); item.append(actions);
+    }
+    $('outbox').append(item);
+  }
+  updateCountdowns();
+}
+function updateCountdowns() {
+  for (const el of document.querySelectorAll('.countdown')) el.textContent = link.opened
+    ? `Следующая попытка через ${Math.max(0, Math.ceil((Number(el.dataset.next) - Date.now()) / 1000))} с`
+    : 'Повторы продолжатся после включения связи';
+}
+function renderMessages() {
+  if (!engine) return;
+  $('messages').replaceChildren();
+  const incoming = engine.state.inbox.filter(s => s.complete && !s.hidden).map(s => ({ ...s, direction: 'rx', at: s.completed, reliable: true }));
+  const messages = [...legacy, ...incoming].sort((a, b) => b.at - a.at).slice(0, 100);
+  $('empty').hidden = messages.length > 0;
+  for (const message of messages) {
+    const item = element('li', undefined, `message ${message.direction}`);
+    const meta = element('div', undefined, 'message-meta');
+    meta.append(element('strong', message.reliable ? 'ПРИНЯТО · CRC СООБЩЕНИЯ ✓' : 'ЖУРНАЛ v0.1'),
+      element('span', `${message.from} → ${message.to} · #${String(message.id).slice(-6)}`),
+      element('time', new Date(message.at).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })));
+    item.append(meta, element('p', message.text)); $('messages').append(item);
+  }
+  const partial = engine.state.inbox.filter(s => !s.complete);
+  $('partial').textContent = partial.map(s => `Получение #${s.id.slice(-6)}: ${s.blocks.filter(Boolean).length}/${s.meta.count} блоков сохранено`).join(' · ');
 }
 
 $('text').addEventListener('input', controls);
-$('send').onclick = send;
-$('listen').onclick = () => receiving ? stopListening() : startListening();
-$('from').onchange = () => {
-  $('to').value = $('from').value === 'BASE' ? 'FIELD' : 'BASE';
-  try { localStorage.setItem('rb-device', $('from').value); } catch { /* Optional preference. */ }
+$('to').addEventListener('change', controls);
+$('send').onclick = async () => {
+  if (queueing || !engine) return;
+  queueing = true; controls(); const text = $('text').value;
+  try {
+    await engine.enqueue(text, $('to').value, currentSettings());
+    if ($('text').value === text) $('text').value = ''; controls();
+    if (!link.opened) await startConnection(); else engine.tick();
+  } catch (error) { warning(`Сообщение не отправлено: ${error.message}`); }
+  finally { queueing = false; controls(); }
 };
+$('listen').onclick = () => link.opened ? stopConnection() : startConnection();
+$('stop-tx').onclick = async () => {
+  if (engine.active) { await engine.pause(engine.active.job.id); link.cancelTransmit?.(); }
+};
+$('from').onchange = async () => {
+  $('to').value = $('from').value === 'BASE' ? 'FIELD' : 'BASE';
+  try { localStorage.setItem('rb-device', $('from').value); await useDevice(); } catch (error) { warning(error.message); }
+};
+for (const id of Object.values(fields)) $(id).addEventListener('input', () => {
+  controls(); try { localStorage.setItem('rb-reliable-settings', JSON.stringify(currentSettings())); } catch { /* Incomplete input or unavailable preferences. */ }
+});
 $('clear').onclick = async () => {
-  try { await clearMessages(); $('messages').replaceChildren(); $('empty').hidden = false; }
-  catch { warning('Браузер не разрешил очистить локальный журнал.'); }
+  try { await clearMessages(); await engine.clearHistory(); legacy = []; renderMessages(); }
+  catch (error) { warning(error.message); }
 };
 $('selftest').onclick = () => {
-  testing = true; controls(); $('test-result').textContent = 'Проверяю модем…';
+  testing = true; controls(); $('test-result').textContent = 'Проверяю физический модем…';
+  const worker = new Worker(new URL('./rx-worker.js', import.meta.url), { type: 'module' });
+  const finish = text => { $('test-result').textContent = text; testing = false; worker.terminate(); controls(); };
+  worker.onmessage = ({ data }) => {
+    if (data.type === 'test-result') finish(data.ok ? `Самопроверка пройдена: текст и CRC верны, AFC ${data.offset.toFixed(1)} Гц. Это программный тест, без микрофона.` : 'Самопроверка не пройдена.');
+  };
+  worker.onerror = () => finish('Ошибка загрузки самопроверки.');
   worker.postMessage({ type: 'selftest', text: 'Привет, RadioBridge!' });
 };
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && receiving) {
-    keepAwake();
-    if (context?.state !== 'running') { stopListening(); status('Звук приостановлен. Нажмите «Слушать» снова.'); }
-  }
+  if (document.visibilityState === 'hidden' && link.opened) stopConnection('Связь приостановлена при сворачивании. Очередь сохранена.');
 });
-window.addEventListener('pagehide', () => { if (receiving) stopListening(); source?.stop(); });
+window.addEventListener('pagehide', () => { engine?.stop().catch(() => {}); link.close(); });
+setInterval(() => { engine?.tick(); updateCountdowns(); }, 250);
 
-try { const saved = localStorage.getItem('rb-device'); if (saved === 'BASE' || saved === 'FIELD') { $('from').value = saved; $('to').value = saved === 'BASE' ? 'FIELD' : 'BASE'; } } catch { /* Optional preference. */ }
-try { for (const message of (await readMessages()).slice(-100)) renderMessage(message); } catch { warning('Локальное хранилище недоступно. Журнал сохранится только до закрытия страницы.'); }
-if (!window.isSecureContext) warning('Для микрофона на Android откройте страницу по HTTPS с доверенным сертификатом. Обычный HTTP по адресу ноутбука не даёт доступ к микрофону. На самом ноутбуке подходит localhost.');
-else if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) warning('Этот браузер не поддерживает необходимый аудиоввод. Используйте актуальный Chrome на Android или ноутбуке.');
+try {
+  let saved = DEFAULTS;
+  try { saved = settings(JSON.parse(localStorage.getItem('rb-reliable-settings') || '{}')); } catch { /* Defaults. */ }
+  for (const [key, id] of Object.entries(fields)) $(id).value = saved[key];
+  try {
+    const device = localStorage.getItem('rb-device');
+    if (['BASE', 'FIELD'].includes(device)) { $('from').value = device; $('to').value = device === 'BASE' ? 'FIELD' : 'BASE'; }
+  } catch { /* Optional. */ }
+  legacy = await readMessages(); await useDevice(); document.body.dataset.ready = 'true';
+} catch (error) { warning(`Хранилище недоступно: ${error.message}. Связь не включена, чтобы не подтверждать несохранённые данные.`); }
+if (!window.isSecureContext) warning('Микрофон требует HTTPS или localhost. На Android можно использовать HTTPS-сайт либо локальный сервер/ADB.');
 controls();
 if ('serviceWorker' in navigator && window.isSecureContext) {
-  navigator.serviceWorker.register(new URL('../sw.js', import.meta.url)).then(async registration => {
-    await navigator.serviceWorker.ready;
-    const active = registration.active ?? navigator.serviceWorker.controller;
+  navigator.serviceWorker.register(new URL('../sw.js', import.meta.url)).then(async () => {
+    const registration = await navigator.serviceWorker.ready;
     const channel = new MessageChannel();
     channel.port1.onmessage = ({ data }) => { if (data === 'offline-ready') $('offline-status').textContent = 'Файлы приложения сохранены для работы без интернета.'; };
-    active?.postMessage('offline-status', [channel.port2]);
-  }).catch(() => { $('offline-status').textContent = 'Офлайн-кэш недоступен. Пока не закрывайте страницу без сети.'; });
+    registration.active?.postMessage('offline-status', [channel.port2]);
+  }).catch(() => { $('offline-status').textContent = 'Офлайн-кэш недоступен.'; });
 }
